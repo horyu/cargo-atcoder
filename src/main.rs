@@ -953,21 +953,6 @@ fn warmup_for(metadata: &Metadata, specs: Option<&[impl AsRef<str>]>) -> Result<
             if !stat.success() {
                 eprintln!("Failed to warm-up");
             }
-
-            println!("Warming up release build for `{}`...", member.name);
-
-            let stat = Command::new("cargo")
-                .arg("build")
-                .arg("--manifest-path")
-                .arg(&member.manifest_path)
-                .arg("--release")
-                .arg("--bin")
-                .arg(&first_bin.name)
-                .status()?;
-
-            if !stat.success() {
-                eprintln!("Failed to warm-up");
-            }
         }
     }
     Ok(())
