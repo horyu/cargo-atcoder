@@ -1,7 +1,5 @@
 # cargo-atcoder
 
-![](https://github.com/tanakh/cargo-atcoder/workflows/Rust/badge.svg) [![Join the chat at https://gitter.im/tanakh/cargo-atcoder](https://badges.gitter.im/tanakh/cargo-atcoder.svg)](https://gitter.im/tanakh/cargo-atcoder?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-
 Cargo subcommand for AtCoder
 
 # 使い方
@@ -9,7 +7,7 @@ Cargo subcommand for AtCoder
 ## インストール
 
 ```
-$ cargo install --git https://github.com/tanakh/cargo-atcoder.git
+$ cargo install --git https://github.com/horyu/cargo-atcoder.git
 ```
 
 ## ログイン

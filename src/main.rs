@@ -95,6 +95,8 @@ async fn new_project(opt: NewOpt) -> Result<()> {
 
     let stat = Command::new("cargo")
         .arg("new")
+        .arg("--vcs")
+        .arg("none")
         .arg(&opt.contest_id)
         .status()?;
     if !stat.success() {
