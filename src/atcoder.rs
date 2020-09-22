@@ -1,17 +1,17 @@
+use crate::http::{Client, StatusError};
 use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, Utc};
 use itertools::Itertools as _;
 use regex::Regex;
 use scraper::{element_ref::ElementRef, Html, Selector};
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::fmt;
+use std::path::Path;
+use url::Url;
 
 const ATCODER_ENDPOINT: &str = "https://atcoder.jp";
 
 pub struct AtCoder {
-    client: reqwest::Client,
-    session_file: PathBuf,
+    client: Client,
 }
 
 #[derive(Debug)]
@@ -204,56 +204,22 @@ impl StatusCode {
     }
 }
 
-async fn http_get(client: &reqwest::Client, url: &str) -> Result<String> {
-    Ok(client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?)
-}
-
-impl Drop for AtCoder {
-    fn drop(&mut self) {
-        let v = self.client.cookie_store_json().unwrap();
-        let dir = self.session_file.parent().unwrap();
-        fs::create_dir_all(dir).unwrap();
-        fs::write(&self.session_file, v).unwrap();
-    }
-}
-
 impl AtCoder {
     pub fn new(session_file: &Path) -> Result<AtCoder> {
-        let cb = reqwest::Client::builder().cookie_store(true);
-
-        let cb = match fs::read(session_file) {
-            Ok(v) => cb.set_cookie_store(v),
-            Err(err) => {
-                if err.kind() == ErrorKind::NotFound {
-                    cb
-                } else {
-                    return Err(err.into());
-                }
-            }
-        };
-
-        Ok(AtCoder {
-            client: cb.build()?,
-            session_file: session_file.to_owned(),
+        Ok(Self {
+            client: Client::new(session_file)?,
         })
     }
 
-    async fn check_login(&self) -> Result<()> {
+    fn check_login(&self) -> Result<()> {
         let _ = self
-            .username()
-            .await?
+            .username()?
             .with_context(|| "You are not logged in. Please login first.")?;
         Ok(())
     }
 
-    pub async fn username(&self) -> Result<Option<String>> {
-        let doc = http_get(&self.client, ATCODER_ENDPOINT).await?;
+    pub fn username(&self) -> Result<Option<String>> {
+        let doc = self.http_get("/")?;
         let doc = Html::parse_document(&doc);
 
         let r = doc
@@ -269,10 +235,9 @@ impl AtCoder {
         ))
     }
 
-    pub async fn login(&self, username: &str, password: &str) -> Result<()> {
-        let doc = http_get(&self.client, &format!("{}/login", ATCODER_ENDPOINT)).await?;
-
-        let document = Html::parse_document(&doc);
+    pub fn login(&self, username: &str, password: &str) -> Result<()> {
+        let document = self.http_get("/login")?;
+        let document = Html::parse_document(&document);
 
         let csrf_token = document
             .select(&Selector::parse("input[name=\"csrf_token\"]").unwrap())
@@ -284,19 +249,14 @@ impl AtCoder {
             .attr("value")
             .with_context(|| "cannot find csrf_token")?;
 
-        let res = self
-            .client
-            .post(&format!("{}/login", ATCODER_ENDPOINT))
-            .form(&[
+        let res = self.http_post_form(
+            "/login",
+            &[
                 ("username", username),
                 ("password", password),
                 ("csrf_token", csrf_token),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+            ],
+        )?;
 
         let res = Html::parse_document(&res);
 
@@ -331,12 +291,8 @@ impl AtCoder {
         Err(anyhow!("Login failed: Unknown error"))
     }
 
-    pub async fn problem_ids_from_score_table(
-        &self,
-        contest_id: &str,
-    ) -> Result<Option<Vec<String>>> {
-        let t = format!("{}/contests/{}", ATCODER_ENDPOINT, contest_id);
-        let doc = http_get(&self.client, &t).await?;
+    pub fn problem_ids_from_score_table(&self, contest_id: &str) -> Result<Option<Vec<String>>> {
+        let doc = self.http_get(&format!("/contests/{}", contest_id))?;
 
         Html::parse_document(&doc)
             .select(&Selector::parse("#contest-statement > .lang > .lang-ja table").unwrap())
@@ -367,11 +323,16 @@ impl AtCoder {
             .transpose()
     }
 
-    pub async fn contest_info(&self, contest_id: &str) -> Result<ContestInfo> {
-        self.check_login().await?;
-
-        let t = format!("{}/contests/{}/tasks", ATCODER_ENDPOINT, contest_id);
-        let doc = http_get(&self.client, &t).await?;
+    pub fn contest_info(&self, contest_id: &str) -> Result<ContestInfo> {
+        let doc = self.retrieve_text_or_error_message(
+            &format!("/contests/{}/tasks", contest_id),
+            || {
+                format!(
+                    "You are not participating in `{}`, or it does not yet exist",
+                    contest_id,
+                )
+            },
+        )?;
 
         let doc = Html::parse_document(&doc);
         let sel_problem = Selector::parse("table tbody tr").unwrap();
@@ -421,11 +382,8 @@ impl AtCoder {
         Ok(ContestInfo { problems })
     }
 
-    pub async fn test_cases(&self, problem_url: &str) -> Result<Vec<TestCase>> {
-        self.check_login().await?;
-
-        let t = format!("{}{}", ATCODER_ENDPOINT, problem_url);
-        let doc = http_get(&self.client, &t).await?;
+    pub fn test_cases(&self, problem_url: &str) -> Result<Vec<TestCase>> {
+        let doc = self.http_get(problem_url)?;
 
         let doc = Html::parse_document(&doc);
 
@@ -455,9 +413,10 @@ impl AtCoder {
                 p.select(&Selector::parse("pre").unwrap())
                     .next()
                     .unwrap()
-                    .inner_html()
-                    .trim()
-                    .to_owned()
+                    .text()
+                    .exactly_one()
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_default()
             };
             if label.starts_with("入力例") {
                 inputs_ja.push(f());
@@ -474,13 +433,19 @@ impl AtCoder {
             }
         }
 
-        assert_eq!(inputs_ja.len(), outputs_ja.len());
-        assert_eq!(inputs_en.len(), outputs_en.len());
-
-        let (inputs, outputs) = if inputs_ja.len() >= inputs_en.len() {
+        let (inputs, outputs) = if !inputs_ja.is_empty() && inputs_ja.len() == outputs_ja.len() {
             (inputs_ja, outputs_ja)
-        } else {
+        } else if !inputs_en.is_empty() && inputs_en.len() == outputs_en.len() {
             (inputs_en, outputs_en)
+        } else {
+            bail!(
+                "Could not scrape sample test cases (JA inputs: {}, JA outputs: {}, EN inputs: \
+                 {}, EN outputs: {})",
+                inputs_ja.len(),
+                outputs_ja.len(),
+                inputs_en.len(),
+                outputs_en.len(),
+            );
         };
 
         let mut ret = vec![];
@@ -493,16 +458,10 @@ impl AtCoder {
         Ok(ret)
     }
 
-    pub async fn submit(
-        &self,
-        contest_id: &str,
-        problem_id: &str,
-        source_code: &str,
-    ) -> Result<()> {
-        self.check_login().await?;
+    pub fn submit(&self, contest_id: &str, problem_id: &str, source_code: &str) -> Result<()> {
+        self.check_login()?;
 
-        let t = format!("{}/contests/{}/submit", ATCODER_ENDPOINT, contest_id);
-        let doc = http_get(&self.client, &t).await?;
+        let doc = self.http_get(&format!("/contests/{}/submit", contest_id))?;
 
         let (task_screen_name, language_id, language_name, csrf_token) = {
             let doc = Html::parse_document(&doc);
@@ -566,21 +525,15 @@ impl AtCoder {
             )
         };
 
-        let t = format!("{}/contests/{}/submit", ATCODER_ENDPOINT, contest_id);
-        let _res = self
-            .client
-            .post(&t)
-            .form(&[
+        let _ = self.http_post_form(
+            &format!("/contests/{}/submit", contest_id),
+            &[
                 ("data.TaskScreenName", &task_screen_name),
                 ("data.LanguageId", &language_id),
-                ("sourceCode", &source_code.to_owned()),
+                ("sourceCode", &source_code),
                 ("csrf_token", &csrf_token),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+            ],
+        )?;
 
         println!(
             "Submitted to problem `{}`, using language `{}`",
@@ -589,34 +542,27 @@ impl AtCoder {
         Ok(())
     }
 
-    pub async fn submission_status(&self, contest_id: &str) -> Result<Vec<SubmissionResult>> {
-        self.check_login().await?;
+    pub fn submission_status(&self, contest_id: &str) -> Result<Vec<SubmissionResult>> {
+        self.check_login()?;
 
         // FIXME: Currently, this returns only up to 20 submissions
 
-        let t = format!(
-            "{}/contests/{}/submissions/me",
-            ATCODER_ENDPOINT, contest_id
-        );
-        let con = http_get(&self.client, &t).await?;
+        let con = self.http_get(&format!("/contests/{}/submissions/me", contest_id))?;
         let doc = Html::parse_document(&con);
 
         let mut ret = vec![];
 
         for r in doc.select(&Selector::parse("table tbody tr").unwrap()) {
-            // <td class="no-break"><time class='fixtime fixtime-second'>2020-01-18 03:59:59+0900</time></td>
+            // <td class="no-break"><time class="fixtime-second">2020-01-18 03:59:59</time></td>
             // <td><a href="/contests/abc123/tasks/abc123_a">A - Five Antennas</a></td>
-            // <td><a href="/users/tanakh">tanakh</a> <a href='/contests/abc123/submissions?f.User=tanakh'><span class='glyphicon glyphicon-search black' aria-hidden='true' data-toggle='tooltip' title='tanakhさんの提出を見る'></span></a></td>
-            // <td>Rust (1.15.1)</td>
+            // <td><a href="/users/tanakh">tanakh</a> <a href="/contests/abc123/submissions?f.User=tanakh"><span class="glyphicon glyphicon-search black" aria-hidden="true" data-toggle="tooltip" title="" data-original-title="tanakhさんの提出を見る"></span></a></td>
+            // <td><a href="/contests/abc123/submissions?f.Language=3504&amp;f.LanguageName=&amp;f.Status=&amp;f.Task=&amp;f.User=tanakh&amp;page=4">Rust (1.15.1)</a></td>
             // <td class="text-right submission-score" data-id="9551881">0</td>
             // <td class="text-right">1970 Byte</td>
-            // <td class='text-center'><span class='label label-warning' aria-hidden='true' data-toggle='tooltip' data-placement='top' title="実行時間制限超過">TLE</span>
-            // </td>
-            // <td class='text-right'>2103 ms</td>
-            // <td class='text-right'>4352 KB</td>
-            // <td class="text-center">
-            //     <a href="/contests/abc123/submissions/9551881">詳細</a>
-            // </td>
+            // <td class="text-center"><span class="label label-warning" aria-hidden="true" data-toggle="tooltip" data-placement="top" title="" data-original-title="実行時間制限超過">TLE</span></td>
+            // <td class="text-right">2103 ms</td>
+            // <td class="text-right">4352 KB</td>
+            // <td class="text-center"><a href="/contests/abc123/submissions/9551881">詳細</a></td>
 
             let res = (|| -> Option<SubmissionResult> {
                 let sel = Selector::parse("td").unwrap();
@@ -640,7 +586,13 @@ impl AtCoder {
                     .value()
                     .as_text()?
                     .to_string();
-                let language = it.next()?.first_child()?.value().as_text()?.to_string();
+                let language = it
+                    .next()?
+                    .first_child()?
+                    .first_child()?
+                    .value()
+                    .as_text()?
+                    .to_string();
                 let t = it.next()?;
                 let id: usize = t.value().attr("data-id")?.parse().ok()?;
                 let score: i64 = t.first_child()?.value().as_text()?.parse().ok()?;
@@ -679,17 +631,15 @@ impl AtCoder {
         Ok(ret)
     }
 
-    pub async fn submission_status_full(
+    pub fn submission_status_full(
         &self,
         contest_id: &str,
         submission_id: usize,
     ) -> Result<FullSubmissionResult> {
-        self.check_login().await?;
-        let t = format!(
-            "{}/contests/{}/submissions/{}",
-            ATCODER_ENDPOINT, contest_id, submission_id,
-        );
-        let con = http_get(&self.client, &t).await?;
+        let con = self.retrieve_text_or_error_message(
+            &format!("/contests/{}/submissions/{}", contest_id, submission_id),
+            || format!("Could not find `{}`", submission_id),
+        )?;
         let doc = Html::parse_document(&con);
 
         // <table class="table table-bordered table-striped">
@@ -824,5 +774,38 @@ impl AtCoder {
         let ret = FullSubmissionResult { result, cases };
 
         Ok(ret)
+    }
+
+    fn retrieve_text_or_error_message<T: fmt::Display, F: FnOnce() -> T>(
+        &self,
+        path: &str,
+        context_on_logged_in: F,
+    ) -> anyhow::Result<String> {
+        self.http_get(path).map_err(|err| {
+            if matches!(err.downcast_ref::<StatusError>(), Some(e) if e.status() == 404) {
+                match self.username() {
+                    Ok(username) => err.context(if username.is_some() {
+                        anyhow!("{}", context_on_logged_in())
+                    } else {
+                        anyhow!("You are not logged in. Please login first")
+                    }),
+                    Err(err) => err,
+                }
+            } else {
+                err
+            }
+        })
+    }
+
+    fn http_get(&self, path: &str) -> anyhow::Result<String> {
+        self.client
+            .get(&format!("{}{}", ATCODER_ENDPOINT, path).parse::<Url>()?)
+    }
+
+    fn http_post_form(&self, path: &str, form: &[(&str, &str)]) -> anyhow::Result<String> {
+        self.client.post_form(
+            &format!("{}{}", ATCODER_ENDPOINT, path).parse::<Url>()?,
+            form,
+        )
     }
 }

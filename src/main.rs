@@ -1,3 +1,4 @@
+use crate::http::StatusError;
 use crate::metadata::{MetadataExt as _, PackageExt as _};
 use anyhow::{bail, ensure, Context as _, Result};
 use bytesize::ByteSize;
@@ -34,15 +35,29 @@ use unicode_width::UnicodeWidthStr as _;
 
 mod atcoder;
 mod config;
+mod http;
 mod metadata;
 
 use atcoder::*;
 use config::{read_config, read_config_preserving, Config};
 
-fn session_file() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap()
-        .join("cargo-atcoder/session.json")
+fn session_file() -> Result<PathBuf> {
+    let dir = if let Some(dir) = env::var_os("CARGO_ATCODER_TEST_CACHE_DIR") {
+        dir.into()
+    } else {
+        dirs::cache_dir()
+            .with_context(|| "failed to get cache dir")?
+            .join("cargo-atcoder")
+    };
+
+    if !dir.is_dir() {
+        if dir.exists() {
+            bail!("{} is not directory", dir.display());
+        }
+        fs::create_dir_all(&dir)?;
+    }
+
+    Ok(dir.join("session.json"))
 }
 
 #[derive(StructOpt)]
@@ -59,20 +74,19 @@ struct NewOpt {
     skip_warmup: bool,
 }
 
-async fn new_project(opt: NewOpt) -> Result<()> {
+fn new_project(opt: NewOpt) -> Result<()> {
     let config = read_config()?;
 
     let bins = if opt.bins.is_empty() {
-        let atc = AtCoder::new(&session_file())?;
+        let atc = AtCoder::new(&session_file()?)?;
 
-        match atc.contest_info(&opt.contest_id).await {
+        match atc.contest_info(&opt.contest_id) {
             Ok(info) => info.problem_ids_lowercase(),
             Err(err) => if_chain! {
-                if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>();
-                if reqwest_err.status().map(Into::into) == Some(404);
+                if let Some(status_err) = err.downcast_ref::<StatusError>();
+                if status_err.status() == 404;
                 then {
-                    atc.problem_ids_from_score_table(&opt.contest_id)
-                        .await?
+                    atc.problem_ids_from_score_table(&opt.contest_id)?
                         .map(|ss| ss.iter().map(|s| s.to_lowercase()).collect())
                         .with_context(|| {
                             err.context(
@@ -121,6 +135,7 @@ async fn new_project(opt: NewOpt) -> Result<()> {
     let mut manifest = fs::read_to_string(&toml_file)?.parse::<toml_edit::Document>()?;
     let conf_preserved = read_config_preserving()?;
     manifest["dependencies"] = conf_preserved["dependencies"].clone();
+    manifest["dev-dependencies"] = conf_preserved["dev-dependencies"].clone();
     manifest["profile"] = toml_edit::Item::Table({
         let mut tbl = toml_edit::Table::new();
         tbl.set_implicit(true);
@@ -141,7 +156,7 @@ async fn new_project(opt: NewOpt) -> Result<()> {
     Ok(())
 }
 
-async fn login() -> Result<()> {
+fn login() -> Result<()> {
     let username = dialoguer::Input::<String>::new()
         .with_prompt("Username")
         .interact()?;
@@ -150,8 +165,8 @@ async fn login() -> Result<()> {
         .with_prompt("Password")
         .interact()?;
 
-    let atc = AtCoder::new(&session_file())?;
-    atc.login(&username, &password).await?;
+    let atc = AtCoder::new(&session_file()?)?;
+    atc.login(&username, &password)?;
 
     println!("Login succeeded.");
 
@@ -159,7 +174,7 @@ async fn login() -> Result<()> {
 }
 
 fn clear_session() -> Result<()> {
-    let path = session_file();
+    let path = session_file()?;
     if path.is_file() {
         fs::remove_file(&path)?;
     }
@@ -193,14 +208,14 @@ struct TestOpt {
     verbose: bool,
 }
 
-async fn test(opt: TestOpt) -> Result<()> {
+fn test(opt: TestOpt) -> Result<()> {
     let cwd = env::current_dir().with_context(|| "failed to get CWD")?;
     let metadata = metadata::cargo_metadata(opt.manifest_path.as_deref(), &cwd)?;
     let package = metadata.query_for_member(opt.package.as_deref())?;
-    let atc = AtCoder::new(&session_file())?;
+    let atc = AtCoder::new(&session_file()?)?;
     let problem_id = opt.problem_id;
     let contest_id = &package.name;
-    let contest_info = atc.contest_info(contest_id).await?;
+    let contest_info = atc.contest_info(contest_id)?;
 
     let problem = contest_info
         .problem(&problem_id)
@@ -210,7 +225,7 @@ async fn test(opt: TestOpt) -> Result<()> {
         return test_custom(package, &problem_id, opt.release);
     }
 
-    let test_cases = atc.test_cases(&problem.url).await?;
+    let test_cases = atc.test_cases(&problem.url)?;
 
     for &cn in opt.case_num.iter() {
         if cn == 0 || cn > test_cases.len() {
@@ -234,8 +249,7 @@ async fn test(opt: TestOpt) -> Result<()> {
         let Target { src_path, .. } = package.find_bin(&problem_id)?;
         let source =
             fs::read(src_path).with_context(|| format!("Failed to read {}", src_path.display()))?;
-        atc.submit(contest_id, &problem_id, &String::from_utf8_lossy(&source))
-            .await?;
+        atc.submit(contest_id, &problem_id, &String::from_utf8_lossy(&source))?;
     }
 
     Ok(())
@@ -569,12 +583,12 @@ async fn submit(opt: SubmitOpt) -> Result<()> {
     let cwd = env::current_dir().with_context(|| "failed to get CWD")?;
     let metadata = metadata::cargo_metadata(opt.manifest_path.as_deref(), &cwd)?;
     let package = metadata.query_for_member(opt.package.as_deref())?;
-    let atc = AtCoder::new(&session_file())?;
+    let atc = AtCoder::new(&session_file()?)?;
     let config = read_config()?;
 
     let contest_id = &package.name;
     let problem_id = opt.problem_id;
-    let contest_info = atc.contest_info(contest_id).await?;
+    let contest_info = atc.contest_info(contest_id)?;
     let problem = contest_info
         .problem(&problem_id)
         .with_context(|| format!("Problem `{}` is not contained in this contest", &problem_id))?;
@@ -583,8 +597,7 @@ async fn submit(opt: SubmitOpt) -> Result<()> {
         true
     } else {
         let test_cases = atc
-            .test_cases(&problem.url)
-            .await?
+            .test_cases(&problem.url)?
             .into_iter()
             .enumerate()
             .collect::<Vec<_>>();
@@ -606,8 +619,7 @@ async fn submit(opt: SubmitOpt) -> Result<()> {
         gen_binary_source(&metadata, package, &target, &config, opt.column, opt.no_upx)?
     };
 
-    atc.submit(contest_id, &problem_id, &String::from_utf8_lossy(&source))
-        .await?;
+    atc.submit(contest_id, &problem_id, &String::from_utf8_lossy(&source))?;
     println!();
 
     println!("Fetching submission result...");
@@ -616,7 +628,7 @@ async fn submit(opt: SubmitOpt) -> Result<()> {
     println!();
 
     if let Some(last_id) = last_id {
-        let res = atc.submission_status_full(contest_id, last_id).await?;
+        let res = atc.submission_status_full(contest_id, last_id)?;
         if let Some(code) = res.result.status.result_code() {
             if !code.accepted() {
                 println!("Submission detail:");
@@ -663,7 +675,6 @@ fn gen_binary_source(
         .arg("--release")
         .arg("--bin")
         .arg(&bin.name)
-        .arg("--quiet")
         .current_dir({
             // `cross` does not work with `--manifest-path <absolute path>`.
             package
@@ -799,7 +810,7 @@ async fn watch(opt: WatchOpt) -> Result<()> {
     let cwd = env::current_dir().with_context(|| "failed to get CWD")?;
     let metadata = metadata::cargo_metadata(opt.manifest_path.as_deref(), &cwd)?;
     let package = metadata.query_for_member(opt.package.as_deref())?.clone();
-    let atc = AtCoder::new(&session_file())?;
+    let atc = AtCoder::new(&session_file()?)?;
 
     let atc = Arc::new(atc);
 
@@ -838,7 +849,7 @@ async fn watch(opt: WatchOpt) -> Result<()> {
 }
 
 async fn watch_filesystem(package: &Package, atc: &AtCoder) -> Result<()> {
-    let contest_info = atc.contest_info(&package.name).await?;
+    let contest_info = atc.contest_info(&package.name)?;
 
     let (tx, rx) = channel();
     let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_millis(150))?;
@@ -886,7 +897,7 @@ async fn watch_filesystem(package: &Package, atc: &AtCoder) -> Result<()> {
 
         file_hash.insert(problem_id.clone(), hash);
 
-        let test_cases = atc.test_cases(&problem.url).await?;
+        let test_cases = atc.test_cases(&problem.url)?;
         let test_cases = test_cases.into_iter().enumerate().collect::<Vec<_>>();
         let test_passed = test_samples(package, &problem_id, &test_cases, false, false)?;
 
@@ -899,10 +910,10 @@ async fn watch_filesystem(package: &Package, atc: &AtCoder) -> Result<()> {
     }
 }
 
-async fn info() -> Result<()> {
-    let atc = AtCoder::new(&session_file())?;
+fn info() -> Result<()> {
+    let atc = AtCoder::new(&session_file()?)?;
 
-    if let Some(username) = atc.username().await? {
+    if let Some(username) = atc.username()? {
         println!("Logged in as {}.", username);
     } else {
         println!("Not logged in.");
@@ -1000,7 +1011,7 @@ async fn watch_submission_status(
         let mut last_id;
 
         loop {
-            let results = atc.submission_status(&contest_id).await?;
+            let results = atc.submission_status(&contest_id)?;
             let mut results = if !recent_only {
                 results
             } else {
@@ -1182,14 +1193,12 @@ struct ResultOpt {
     verbose: bool,
 }
 
-async fn result(opt: ResultOpt) -> Result<()> {
+fn result(opt: ResultOpt) -> Result<()> {
     let cwd = env::current_dir().with_context(|| "failed to get CWD")?;
     let metadata = metadata::cargo_metadata(opt.manifest_path.as_deref(), &cwd)?;
-    let atc = AtCoder::new(&session_file())?;
+    let atc = AtCoder::new(&session_file()?)?;
     let contest_id = &metadata.query_for_member(opt.package.as_deref())?.name;
-    let res = atc
-        .submission_status_full(contest_id, opt.submission_id)
-        .await?;
+    let res = atc.submission_status_full(contest_id, opt.submission_id)?;
 
     print_full_result(&res, opt.verbose)
 }
@@ -1309,7 +1318,7 @@ struct StatusOpt {
 async fn status(opt: StatusOpt) -> Result<()> {
     let cwd = env::current_dir().with_context(|| "failed to get CWD")?;
     let metadata = metadata::cargo_metadata(opt.manifest_path.as_deref(), &cwd)?;
-    let atc = AtCoder::new(&session_file())?;
+    let atc = AtCoder::new(&session_file()?)?;
     let contest_id = &metadata.query_for_member(opt.package.as_deref())?.name;
     let atc = Arc::new(atc);
     watch_submission_status(atc, contest_id, false).await?;
@@ -1359,15 +1368,15 @@ async fn main() -> Result<()> {
 
     use OptAtCoder::*;
     match opt {
-        New(opt) => new_project(opt).await,
-        Login => login().await,
+        New(opt) => new_project(opt),
+        Login => login(),
         // Logout => unimplemented!(),
         ClearSession => clear_session(),
-        Info => info().await,
+        Info => info(),
         Warmup(opt) => warmup(opt),
-        Test(opt) => test(opt).await,
+        Test(opt) => test(opt),
         Submit(opt) => submit(opt).await,
-        Result(opt) => result(opt).await,
+        Result(opt) => result(opt),
         GenBinary(opt) => gen_binary(opt),
         Status(opt) => status(opt).await,
         Watch(opt) => watch(opt).await,

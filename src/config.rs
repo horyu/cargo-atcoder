@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
-use serde_derive::Deserialize;
-use std::fs;
+use serde::Deserialize;
 use std::path::PathBuf;
+use std::{env, fs};
 use toml::Value;
 use toml_edit::Document;
 
@@ -41,11 +41,15 @@ lazy_static::lazy_static! {
 }
 
 fn config_path() -> Result<PathBuf> {
-    let config_path = dirs::config_dir()
-        .with_context(|| "Failed to get config directory")?
-        .join("cargo-atcoder.toml");
+    let config_path = if let Some(path) = env::var_os("CARGO_ATCODER_TEST_CONFIG_DIR") {
+        path.into()
+    } else {
+        dirs::config_dir().with_context(|| "Failed to get config directory")?
+    }
+    .join("cargo-atcoder.toml");
 
     if !config_path.exists() {
+        fs::create_dir_all(config_path.parent().unwrap())?;
         fs::write(&config_path, DEFAULT_CONFIG_STR)?;
     }
 
